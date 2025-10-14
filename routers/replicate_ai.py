@@ -217,7 +217,6 @@ async def replicate_webhook(request: Request):
             supabase.table("replicate_jobs")
             .update(update_payload)
             .eq("prediction_id", prediction_id)
-            .select("*")
             .execute()
         )
     except Exception as exc:
@@ -232,6 +231,26 @@ async def replicate_webhook(request: Request):
     data = getattr(response, "data", None)
     if data is None and isinstance(response, dict):
         data = response.get("data")
+
+    if not data:
+        print(
+            f"[replicate_webhook] Prediction {prediction_id} not found when updating; "
+            "attempting to insert fallback record."
+        )
+        try:
+            insert_payload = {"prediction_id": prediction_id, **update_payload}
+            response = supabase.table("replicate_jobs").insert(insert_payload).execute()
+            data = getattr(response, "data", None)
+            if data is None and isinstance(response, dict):
+                data = response.get("data")
+        except Exception as exc:
+            print(
+                f"[replicate_webhook] Fallback insert failed for prediction {prediction_id}: {exc}"
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to persist replicate job: {exc}",
+            ) from exc
 
     print(
         f"[replicate_webhook] Updated prediction {prediction_id} "
