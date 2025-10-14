@@ -1,14 +1,23 @@
-from typing import Optional
-from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Request
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional
+
+import os
+import replicate
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-import replicate
-import os
-from core.config import settings
 
-# Configure le token pour le client Python
+from core.config import settings
+from core.security import verify_supabase_jwt
+from core.supabase_client import get_supabase_client
+
+MODEL_ID = "ideogram-ai/ideogram-character"
+
+# Configure the token for the Replicate client
 os.environ["REPLICATE_API_TOKEN"] = settings.REPLICATE_API_TOKEN
+
 router = APIRouter()
+
 
 # ---------- SCHEMAS ----------
 class IdeogramRunIn(BaseModel):
@@ -20,81 +29,45 @@ class IdeogramRunIn(BaseModel):
     rendering_speed: str = "Default"
     magic_prompt_option: str = "Auto"
 
+
 class PredictionCreateIn(IdeogramRunIn):
-    webhook_events: list[str] = ["completed"]  # "start", "output", "logs", "completed"]
+    webhook_events: list[str] = ["completed"]
 
-# ---------- 1) APPEL DIRECT (synchrone) ----------
+
+def _extract_user_id(token_payload: Dict[str, Any]) -> Optional[str]:
+    """
+    Pull the Supabase user identifier from the decoded JWT payload.
+    """
+    possible_ids = [
+        token_payload.get("sub"),
+        token_payload.get("user_id"),
+    ]
+    user_claim = token_payload.get("user")
+    if isinstance(user_claim, dict):
+        possible_ids.append(user_claim.get("id"))
+
+    for candidate in possible_ids:
+        if candidate:
+            return str(candidate)
+    return None
+
+
+def _utc_now_iso() -> str:
+    """Return the current UTC timestamp in ISO 8601 format."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+# ---------- 1) Direct call (synchronous) ----------
 @router.post("/ideogram/run-direct")
-async def run_ideogram_direct(payload: IdeogramRunIn):
-    """
-    Lance le modèle et retourne directement l'URL du fichier résultat.
-    Idéal pour tests/POC. En prod, préfère la version webhook.
-    """
-    try:
-        output = replicate.run(
-            "ideogram-ai/ideogram-character",
-            input={
-                "prompt": payload.prompt,
-                "resolution": payload.resolution,
-                "style_type": payload.style_type,
-                "aspect_ratio": payload.aspect_ratio,
-                "rendering_speed": payload.rendering_speed,
-                "magic_prompt_option": payload.magic_prompt_option,
-                "character_reference_image": payload.character_reference_image
-            },
-        )
-        # La lib retourne un objet "file-like" moderne : .url() pour l’URL
-        output_url = getattr(output, "url", None)
-        if callable(output_url):
-            output_url = output_url()
-        elif output_url is None and isinstance(output, str):
-            output_url = output
-        return {"status": "succeeded", "output_url": output_url}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-# ---------- 1b) Variante avec upload local ----------
-@router.post("/ideogram/run-direct-upload")
-async def run_ideogram_direct_upload(
-    prompt: str = Form(...),
-    file: UploadFile = File(...)
+async def run_ideogram_direct(
+    payload: IdeogramRunIn,
+    token_payload: Dict[str, Any] = Depends(verify_supabase_jwt),
 ):
-    """
-    Envoie un fichier local (UploadFile) comme character_reference_image.
-    """
+    # Token payload is only used to ensure the caller is authenticated.
+    _ = token_payload
     try:
-        # Pas besoin de sauvegarder sur disque : la lib accepte un file-like
-        character_reference_image = file.file  # file-like object
         output = replicate.run(
-            "ideogram-ai/ideogram-character",
-            input={
-                "prompt": prompt,
-                "character_reference_image": character_reference_image
-            },
-        )
-        output_url = getattr(output, "url", None)
-        if callable(output_url):
-            output_url = output_url()
-        elif output_url is None and isinstance(output, str):
-            output_url = output
-        return {"status": "succeeded", "output_url": output_url}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-# ---------- 2) CRÉATION DE PRÉDICTION + WEBHOOK ----------
-@router.post("/ideogram/predictions")
-async def create_prediction(payload: PredictionCreateIn):
-    """
-    Crée une prédiction Replicate et demande à Replicate d’appeler notre webhook.
-    Retourne l'id de prédiction et status initial.
-    """
-    try:
-        if not settings.WEBHOOK_BASE_URL:
-            raise HTTPException(500, "WEBHOOK_BASE_URL non configuré")
-
-        callback_url = f"{settings.WEBHOOK_BASE_URL}/ai/webhooks/replicate"
-        prediction = replicate.predictions.create(
-            model="ideogram-ai/ideogram-character",
+            MODEL_ID,
             input={
                 "prompt": payload.prompt,
                 "resolution": payload.resolution,
@@ -104,64 +77,160 @@ async def create_prediction(payload: PredictionCreateIn):
                 "magic_prompt_option": payload.magic_prompt_option,
                 "character_reference_image": payload.character_reference_image,
             },
-            webhook=callback_url,
+        )
+        output_url = getattr(output, "url", None)
+        if callable(output_url):
+            output_url = output_url()
+        elif output_url is None and isinstance(output, str):
+            output_url = output
+        return {"status": "succeeded", "output_url": output_url}
+    except Exception as exc:  # pragma: no cover - replicate errors bubble up
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+# ---------- 2) Prediction creation + webhook ----------
+@router.post("/ideogram/predictions")
+async def create_prediction(
+    payload: PredictionCreateIn,
+    token_payload: Dict[str, Any] = Depends(verify_supabase_jwt),
+):
+    if not settings.WEBHOOK_BASE_URL:
+        raise HTTPException(
+            status_code=500,
+            detail="WEBHOOK_BASE_URL is not configured",
+        )
+
+    try:
+        prediction = replicate.predictions.create(
+            model=MODEL_ID,
+            input={
+                "prompt": payload.prompt,
+                "resolution": payload.resolution,
+                "style_type": payload.style_type,
+                "aspect_ratio": payload.aspect_ratio,
+                "rendering_speed": payload.rendering_speed,
+                "magic_prompt_option": payload.magic_prompt_option,
+                "character_reference_image": payload.character_reference_image,
+            },
+            webhook=f"{settings.WEBHOOK_BASE_URL}/ai/webhooks/replicate",
             webhook_events_filter=payload.webhook_events,
         )
-        # Tu peux persister prediction.id dans ta BDD ici (Supabase)
-        # await save_prediction_in_db(prediction.id, status=prediction.status, ...)
-        return {"prediction_id": prediction.id, "status": prediction.status}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-# ---------- 3) POLLING (récupérer l’état d’une prédiction) ----------
-@router.get("/predictions/{prediction_id}")
-async def get_prediction(prediction_id: str):
+    user_id = _extract_user_id(token_payload)
+    supabase = get_supabase_client()
+    job_record: Dict[str, Any] = {
+        "prediction_id": prediction.id,
+        "model": MODEL_ID,
+        "prompt": payload.prompt,
+        "status": prediction.status,
+        "metadata": payload.model_dump(exclude={"prompt"}, exclude_none=True),
+        "updated_at": _utc_now_iso(),
+    }
+    if user_id:
+        job_record["user_id"] = user_id
+
     try:
-        p = replicate.predictions.get(prediction_id)
-        # Si terminé, p.output peut contenir des fichiers (souvent liste)
-        # NB: avec ce modèle .run retourne un handler .url(), ici via predictions, regarde p.output
-        return {
-            "id": p.id,
-            "status": p.status,
-            "output": p.output,  # parfois liste d'urls, ou objets fichiers
-            "logs": p.logs,
-            "error": p.error,
-        }
-    except Exception as e:
-        raise HTTPException(status_code=404, detail=str(e))
+        supabase.table("replicate_jobs").insert(job_record).execute()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to persist replicate job: {exc}",
+        ) from exc
 
-# ---------- WEBHOOK RECEIVER ----------
+    return {
+        "prediction_id": prediction.id,
+        "status": prediction.status,
+    }
+
+
+# ---------- 3) Poll a prediction (reads from Supabase) ----------
+@router.get("/predictions/{prediction_id}")
+async def get_prediction(
+    prediction_id: str,
+    token_payload: Dict[str, Any] = Depends(verify_supabase_jwt),
+):
+    supabase = get_supabase_client()
+    try:
+        response = (
+            supabase.table("replicate_jobs")
+            .select("*")
+            .eq("prediction_id", prediction_id)
+            .limit(1)
+            .execute()
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to fetch prediction state: {exc}",
+        ) from exc
+
+    data = getattr(response, "data", None)
+    if data is None and isinstance(response, dict):
+        data = response.get("data")
+    if not data:
+        raise HTTPException(status_code=404, detail="Prediction not found")
+
+    record = data[0]
+    user_id = _extract_user_id(token_payload)
+    record_user_id = record.get("user_id")
+    if record_user_id and user_id and str(record_user_id) != str(user_id):
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    return record
+
+
+# ---------- Webhook receiver ----------
 @router.post("/webhooks/replicate")
 async def replicate_webhook(request: Request):
-    """
-    Point d’entrée pour les webhooks Replicate.
-    Événements possibles: start, output, logs, completed (selon webhook_events_filter).
-    """
-    # (Optionnel) Vérif signature si tu actives la signature côté Replicate:
-    # doc: "Verifying webhooks" (mets le secret dans settings.REPLICATE_WEBHOOK_SECRET)
-    # Exemple de squelette (dépend de la mécanique de Replicate, adapte si nécessaire) :
-    # signature = request.headers.get("Replicate-Signature", "")
-    # body = await request.body()
-    # if not verify_signature(signature, body, settings.REPLICATE_WEBHOOK_SECRET):
-    #     raise HTTPException(status_code=401, detail="Invalid signature")
-
     payload = await request.json()
-    # Exemple de forme attendue :
-    # {
-    #   "id": "z3wbih3bs64of...",
-    #   "status": "completed",
-    #   "output": [...],  # souvent des urls
-    #   "logs": "...",
-    #   ...
-    # }
 
     prediction_id = payload.get("id")
     status = payload.get("status")
-    output = payload.get("output")
 
-    # ➜ Ici, en pratique, tu mets à jour ta BDD (Supabase) avec (status, output)
-    # await update_prediction_in_db(prediction_id, status, output)
+    if not prediction_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Missing prediction id in webhook payload",
+        )
 
-    # Tu peux déclencher un post-traitement (upload vers Supabase Storage, etc.)
+    update_payload: Dict[str, Any] = {
+        "status": status,
+        "output": {
+            "data": payload.get("output"),
+            "logs": payload.get("logs"),
+        },
+        "error_message": payload.get("error"),
+        "updated_at": _utc_now_iso(),
+    }
 
-    return JSONResponse({"ok": True, "prediction_id": prediction_id, "status": status})
+    if status in {"succeeded", "failed", "canceled", "completed"}:
+        update_payload["completed_at"] = update_payload["updated_at"]
+
+    supabase = get_supabase_client()
+    try:
+        response = (
+            supabase.table("replicate_jobs")
+            .update(update_payload)
+            .eq("prediction_id", prediction_id)
+            .execute()
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to update replicate job: {exc}",
+        ) from exc
+
+    data = getattr(response, "data", None)
+    if data is None and isinstance(response, dict):
+        data = response.get("data")
+
+    return JSONResponse(
+        {
+            "ok": True,
+            "prediction_id": prediction_id,
+            "status": status,
+            "job_updated": bool(data),
+        }
+    )
