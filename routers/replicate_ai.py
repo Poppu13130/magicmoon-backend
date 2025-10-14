@@ -195,25 +195,28 @@ async def replicate_webhook(request: Request):
             detail="Missing prediction id in webhook payload",
         )
 
+    normalized_status = status or "unknown"
     update_payload: Dict[str, Any] = {
-        "status": status,
-        "output": {
-            "data": payload.get("output"),
-            "logs": payload.get("logs"),
-        },
+        "prediction_id": prediction_id,
+        "status": normalized_status,
+        "output": payload.get("output"),
         "error_message": payload.get("error"),
         "updated_at": _utc_now_iso(),
     }
 
-    if status in {"succeeded", "failed", "canceled", "completed"}:
+    metadata_from_payload = payload.get("metadata")
+    if metadata_from_payload is not None:
+        update_payload["metadata"] = metadata_from_payload
+
+    if normalized_status in {"succeeded", "failed", "canceled", "completed"}:
         update_payload["completed_at"] = update_payload["updated_at"]
 
     supabase = get_supabase_client()
     try:
         response = (
             supabase.table("replicate_jobs")
-            .update(update_payload)
-            .eq("prediction_id", prediction_id)
+            .upsert(update_payload, on_conflict="prediction_id")
+            .select("*")
             .execute()
         )
     except Exception as exc:
@@ -226,11 +229,26 @@ async def replicate_webhook(request: Request):
     if data is None and isinstance(response, dict):
         data = response.get("data")
 
+    error = getattr(response, "error", None)
+    if error:
+        print(
+            f"[replicate_webhook] Supabase error updating prediction {prediction_id}: {error}"
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Supabase update error: {error}",
+        )
+
+    print(
+        f"[replicate_webhook] Updated prediction {prediction_id} "
+        f"status={normalized_status} job_updated={bool(data)}"
+    )
+
     return JSONResponse(
         {
             "ok": True,
             "prediction_id": prediction_id,
-            "status": status,
+            "status": normalized_status,
             "job_updated": bool(data),
         }
     )
