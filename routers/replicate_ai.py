@@ -215,11 +215,15 @@ async def replicate_webhook(request: Request):
     try:
         response = (
             supabase.table("replicate_jobs")
-            .upsert(update_payload, on_conflict="prediction_id")
+            .update(update_payload)
+            .eq("prediction_id", prediction_id)
             .select("*")
             .execute()
         )
     except Exception as exc:
+        print(
+            f"[replicate_webhook] Failed to update prediction {prediction_id}: {exc}"
+        )
         raise HTTPException(
             status_code=500,
             detail=f"Failed to update replicate job: {exc}",
@@ -228,16 +232,6 @@ async def replicate_webhook(request: Request):
     data = getattr(response, "data", None)
     if data is None and isinstance(response, dict):
         data = response.get("data")
-
-    error = getattr(response, "error", None)
-    if error:
-        print(
-            f"[replicate_webhook] Supabase error updating prediction {prediction_id}: {error}"
-        )
-        raise HTTPException(
-            status_code=500,
-            detail=f"Supabase update error: {error}",
-        )
 
     print(
         f"[replicate_webhook] Updated prediction {prediction_id} "
