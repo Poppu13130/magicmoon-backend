@@ -183,6 +183,8 @@ def _store_assets_for_prediction(
 
     if not folder_id and folder_path:
         folder_id = _resolve_folder_id(supabase, user_id, None, folder_path)
+    if folder_id:
+        folder_id = str(folder_id)
 
     try:
         existing_resp = (
@@ -279,12 +281,19 @@ async def create_prediction(
     payload: PredictionCreateIn,
     token_payload: Dict[str, Any] = Depends(verify_supabase_jwt),
 ):
+    if payload.folder_id and payload.folder_path:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide either folder_id or folder_path, not both.",
+        )
+
     if not settings.WEBHOOK_BASE_URL:
         raise HTTPException(
             status_code=500,
             detail="WEBHOOK_BASE_URL is not configured",
         )
 
+    supabase = get_supabase_client()
     try:
         prediction = replicate.predictions.create(
             model=MODEL_ID,
@@ -304,13 +313,25 @@ async def create_prediction(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     user_id = _extract_user_id(token_payload)
-    supabase = get_supabase_client()
+
+    resolved_folder_id: Optional[str] = None
+    if user_id:
+        resolved_folder_id = _resolve_folder_id(
+            supabase,
+            user_id,
+            payload.folder_id,
+            payload.folder_path,
+        )
+
     job_record: Dict[str, Any] = {
         "prediction_id": prediction.id,
         "model": MODEL_ID,
         "prompt": payload.prompt,
         "status": prediction.status,
-        "metadata": payload.model_dump(exclude={"prompt"}, exclude_none=True),
+        "metadata": {
+            **payload.model_dump(exclude={"prompt"}, exclude_none=True),
+            **({"resolved_folder_id": resolved_folder_id} if resolved_folder_id else {}),
+        },
         "updated_at": _utc_now_iso(),
     }
     if user_id:
@@ -351,9 +372,7 @@ async def get_prediction(
             detail=f"Failed to fetch prediction state: {exc}",
         ) from exc
 
-    data = getattr(response, "data", None)
-    if data is None and isinstance(response, dict):
-        data = response.get("data")
+    data = _response_data(response)
     if not data:
         raise HTTPException(status_code=404, detail="Prediction not found")
 
@@ -380,7 +399,8 @@ async def replicate_webhook(request: Request):
             detail="Missing prediction id in webhook payload",
         )
 
-    normalized_status = status or "unknown"
+    normalized_status_raw = status or "unknown"
+    normalized_status = normalized_status_raw.lower()
     update_payload: Dict[str, Any] = {
         "prediction_id": prediction_id,
         "status": normalized_status,
@@ -413,9 +433,7 @@ async def replicate_webhook(request: Request):
             detail=f"Failed to update replicate job: {exc}",
         ) from exc
 
-    data = getattr(response, "data", None)
-    if data is None and isinstance(response, dict):
-        data = response.get("data")
+    data = _response_data(response)
 
     if not data:
         print(
@@ -425,9 +443,7 @@ async def replicate_webhook(request: Request):
         try:
             insert_payload = {"prediction_id": prediction_id, **update_payload}
             response = supabase.table("replicate_jobs").insert(insert_payload).execute()
-            data = getattr(response, "data", None)
-            if data is None and isinstance(response, dict):
-                data = response.get("data")
+            data = _response_data(response)
         except Exception as exc:
             print(
                 f"[replicate_webhook] Fallback insert failed for prediction {prediction_id}: {exc}"
@@ -436,6 +452,29 @@ async def replicate_webhook(request: Request):
                 status_code=500,
                 detail=f"Failed to persist replicate job: {exc}",
             ) from exc
+
+    job_response = (
+        supabase.table("replicate_jobs")
+        .select("id, user_id, prompt, metadata")
+        .eq("prediction_id", prediction_id)
+        .limit(1)
+        .execute()
+    )
+    job_data = _response_data(job_response)
+    job_record = job_data[0] if job_data else None
+
+    success_statuses = {"succeeded", "completed", "success"}
+    urls = _extract_output_urls(payload.get("output"))
+    if not urls and payload.get("urls"):
+        urls = _extract_output_urls(payload.get("urls"))
+
+    if job_record and urls and normalized_status in success_statuses:
+        _store_assets_for_prediction(supabase, job_record, prediction_id, urls)
+    elif not job_record:
+        print(
+            f"[replicate_webhook] Unable to load job record for prediction {prediction_id}; "
+            "skipping asset persistence."
+        )
 
     print(
         f"[replicate_webhook] Updated prediction {prediction_id} "
