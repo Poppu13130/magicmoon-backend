@@ -9,6 +9,7 @@ import replicate
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from supabase.storage.types import FileOptions
 
 from core.config import settings
 from core.security import verify_supabase_jwt
@@ -234,13 +235,11 @@ async def _store_assets_for_prediction(
             storage_path = fileinfo["path"]
 
             try:
+                file_options = FileOptions(content_type=content_type, upsert=True)
                 supabase.storage.from_("assets").upload(
                     storage_path,
                     content_bytes,
-                    {
-                        "contentType": content_type,
-                        "upsert": True,
-                    },
+                    file_options,
                 )
             except Exception as exc:
                 print(
