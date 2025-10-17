@@ -180,6 +180,7 @@ def _store_assets_for_prediction(
     metadata = job.get("metadata") or {}
     folder_id = metadata.get("resolved_folder_id") or metadata.get("folder_id")
     folder_path = metadata.get("folder_path")
+    source_task_id = metadata.get("task_id") or job.get("task_id")
 
     if not folder_id and folder_path:
         folder_id = _resolve_folder_id(supabase, user_id, None, folder_path)
@@ -223,11 +224,12 @@ def _store_assets_for_prediction(
             "path": fileinfo["path"],
             "filename": fileinfo["filename"],
             "status": "ready",
-            "source_task_id": job.get("id"),
             "metadata": asset_metadata,
         }
         if folder_id:
             record["folder_id"] = folder_id
+        if source_task_id:
+            record["source_task_id"] = source_task_id
         new_records.append(record)
 
     if not new_records:
