@@ -1,12 +1,14 @@
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
+import json
 
+import httpx
 import os
 import replicate
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from urllib.parse import urlparse
 
 from core.config import settings
 from core.security import verify_supabase_jwt
@@ -160,7 +162,7 @@ def _build_asset_fileinfo(prediction_id: str, index: int, url: str) -> Dict[str,
     return {"filename": filename, "path": pseudo_path}
 
 
-def _store_assets_for_prediction(
+async def _store_assets_for_prediction(
     supabase: Any,
     job: Dict[str, Any],
     prediction_id: str,
@@ -178,6 +180,11 @@ def _store_assets_for_prediction(
         return
 
     metadata = job.get("metadata") or {}
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except Exception:  # pragma: no cover
+            metadata = {}
     folder_id = metadata.get("resolved_folder_id") or metadata.get("folder_id")
     folder_path = metadata.get("folder_path")
     source_task_id = metadata.get("task_id") or job.get("task_id")
@@ -206,31 +213,63 @@ def _store_assets_for_prediction(
     }
 
     new_records: List[Dict[str, Any]] = []
-    for index, url in enumerate(urls):
-        cleaned_url = url.strip()
-        if not cleaned_url or cleaned_url in existing_urls:
-            continue
-        fileinfo = _build_asset_fileinfo(prediction_id, index, cleaned_url)
-        asset_metadata = {
-            "source": "replicate",
-            "prediction_id": prediction_id,
-            "external_url": cleaned_url,
-            "prompt": job.get("prompt"),
-            "folder_path": folder_path,
-        }
-        record: Dict[str, Any] = {
-            "user_id": user_id,
-            "type": "image",
-            "path": fileinfo["path"],
-            "filename": fileinfo["filename"],
-            "status": "ready",
-            "metadata": asset_metadata,
-        }
-        if folder_id:
-            record["folder_id"] = folder_id
-        if source_task_id:
-            record["source_task_id"] = source_task_id
-        new_records.append(record)
+    async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+        for index, url in enumerate(urls):
+            cleaned_url = url.strip()
+            if not cleaned_url or cleaned_url in existing_urls:
+                continue
+
+            try:
+                response = await client.get(cleaned_url)
+                response.raise_for_status()
+            except Exception as exc:
+                print(
+                    f"[replicate_webhook] Failed to download asset {cleaned_url}: {exc}"
+                )
+                continue
+
+            content_type = response.headers.get("content-type", "image/png")
+            content_bytes = response.content
+            fileinfo = _build_asset_fileinfo(prediction_id, index, cleaned_url)
+            storage_path = fileinfo["path"]
+
+            try:
+                supabase.storage.from_("assets").upload(
+                    storage_path,
+                    content_bytes,
+                    {
+                        "contentType": content_type,
+                        "upsert": True,
+                    },
+                )
+            except Exception as exc:
+                print(
+                    f"[replicate_webhook] Failed to upload asset {storage_path} to bucket: {exc}"
+                )
+                continue
+
+            asset_metadata = {
+                "source": "replicate",
+                "prediction_id": prediction_id,
+                "external_url": cleaned_url,
+                "folder_path": folder_path,
+            }
+            record: Dict[str, Any] = {
+                "user_id": user_id,
+                "bucket": "assets",
+                "type": "image",
+                "path": storage_path,
+                "filename": fileinfo["filename"],
+                "status": "ready",
+                "mime_type": content_type,
+                "size_bytes": len(content_bytes),
+                "metadata": asset_metadata,
+            }
+            if folder_id:
+                record["folder_id"] = folder_id
+            if source_task_id:
+                record["source_task_id"] = source_task_id
+            new_records.append(record)
 
     if not new_records:
         return
@@ -471,7 +510,7 @@ async def replicate_webhook(request: Request):
         urls = _extract_output_urls(payload.get("urls"))
 
     if job_record and urls and normalized_status in success_statuses:
-        _store_assets_for_prediction(supabase, job_record, prediction_id, urls)
+        await _store_assets_for_prediction(supabase, job_record, prediction_id, urls)
     elif not job_record:
         print(
             f"[replicate_webhook] Unable to load job record for prediction {prediction_id}; "
