@@ -150,15 +150,26 @@ def _extract_output_urls(output: Any) -> List[str]:
     return deduped
 
 
-def _build_asset_fileinfo(prediction_id: str, index: int, url: str) -> Dict[str, str]:
-    """Return filename and pseudo path for the asset stored in DB."""
+def _build_asset_fileinfo(
+    prediction_id: str,
+    index: int,
+    url: str,
+    folder_path: Optional[str] = None,
+) -> Dict[str, str]:
+    """Return filename and storage path within the assets bucket."""
     parsed = urlparse(url)
     base = parsed.path.rsplit("/", 1)[-1] if parsed.path else ""
     name, ext = os.path.splitext(base)
     if not ext:
         ext = ".png"
     filename = f"{prediction_id}_{index}{ext}"
-    pseudo_path = f"replicate/{prediction_id}/{filename}"
+
+    segments = ["all", "replicate"]
+    if folder_path:
+        segments.extend(part for part in folder_path.split("/") if part)
+    segments.extend([prediction_id, filename])
+    pseudo_path = "/".join(segments)
+
     return {"filename": filename, "path": pseudo_path}
 
 
@@ -230,7 +241,12 @@ async def _store_assets_for_prediction(
 
             content_type = response.headers.get("content-type", "image/png")
             content_bytes = response.content
-            fileinfo = _build_asset_fileinfo(prediction_id, index, cleaned_url)
+            fileinfo = _build_asset_fileinfo(
+                prediction_id,
+                index,
+                cleaned_url,
+                folder_path=folder_path,
+            )
             storage_path = fileinfo["path"]
 
             try:
