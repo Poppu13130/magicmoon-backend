@@ -266,8 +266,6 @@ def _build_asset_fileinfo(
     segments: List[str] = [user_id]
     if folder_path:
         segments.extend(part for part in folder_path.split("/") if part)
-    else:
-        segments.append("replicate")
     segments.extend([prediction_id, filename])
     pseudo_path = "/".join(segments)
 
