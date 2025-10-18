@@ -252,6 +252,7 @@ def _build_asset_fileinfo(
     prediction_id: str,
     index: int,
     url: str,
+    user_id: str,
     folder_path: Optional[str] = None,
 ) -> Dict[str, str]:
     """Return filename and storage path within the assets bucket."""
@@ -262,7 +263,7 @@ def _build_asset_fileinfo(
         ext = ".png"
     filename = f"{prediction_id}_{index}{ext}"
 
-    segments: List[str] = ["all"]
+    segments: List[str] = [user_id]
     if folder_path:
         segments.extend(part for part in folder_path.split("/") if part)
     else:
@@ -351,6 +352,7 @@ async def _store_assets_for_prediction(
                 prediction_id,
                 index,
                 cleaned_url,
+                user_id,
                 folder_path=folder_path,
             )
             storage_path = fileinfo["path"]
