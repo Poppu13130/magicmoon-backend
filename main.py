@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from routers import auth, replicate_ai
+from routers import auth, replicate_ai, enhancor_crisp
 
 app = FastAPI(title="FastAPI x Replicate")
 
@@ -18,6 +18,7 @@ app.include_router(auth.router, prefix="/auth")
 
 # Routes "AI"
 app.include_router(replicate_ai.router, prefix="/ai", tags=["ai"])
+app.include_router(enhancor_crisp.router, prefix="/ai", tags=["enhancor-crisp"])
 
 @app.get("/")
 def root():
