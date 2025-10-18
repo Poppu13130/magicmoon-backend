@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 import json
 
@@ -62,6 +62,22 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _normalize_folder_path(folder_path: Optional[str]) -> Optional[str]:
+    """Normalize folder path strings (split on '/', remove empties)."""
+    if not folder_path:
+        return None
+    segments = [segment.strip() for segment in folder_path.split("/") if segment.strip()]
+    if not segments:
+        return None
+    return "/".join(segments)
+
+
+def _ltree_to_path(ltree_value: Optional[str]) -> Optional[str]:
+    if not ltree_value:
+        return None
+    return "/".join(part for part in ltree_value.split(".") if part)
+
+
 def _response_data(response: Any) -> Optional[List[Dict[str, Any]]]:
     """Normalize supabase responses to a list of dicts or None."""
     if response is None:
@@ -70,6 +86,95 @@ def _response_data(response: Any) -> Optional[List[Dict[str, Any]]]:
     if data is None and isinstance(response, dict):
         data = response.get("data")
     return data
+
+
+def _ensure_folder_path(
+    supabase: Any, user_id: str, folder_path: str
+) -> Tuple[str, str]:
+    """
+    Ensure the provided slash-separated folder path exists.
+    Returns (folder_id, normalized_path)
+    """
+    normalized = _normalize_folder_path(folder_path)
+    if not normalized:
+        raise HTTPException(status_code=400, detail="Invalid folder_path value")
+
+    segments = normalized.split("/")
+    current_id: Optional[str] = None
+    path_parts: List[str] = []
+
+    for segment in segments:
+        path_parts.append(segment)
+        ltree_value = ".".join(path_parts)
+
+        try:
+            response = (
+                supabase.table("folders")
+                .select("id")
+                .eq("user_id", user_id)
+                .eq("path", ltree_value)
+                .limit(1)
+                .execute()
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Unable to check folder path '{normalized}': {exc}",
+            ) from exc
+
+        data = _response_data(response)
+        if data:
+            current_id = data[0]["id"]
+            continue
+
+        insert_payload = {
+            "user_id": user_id,
+            "name": segment,
+            "parent_id": current_id,
+            "path": ltree_value,
+        }
+        try:
+            insert_response = (
+                supabase.table("folders")
+                .insert(insert_payload)
+                .select("id")
+                .execute()
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Unable to create folder '{segment}' in path '{normalized}': {exc}",
+            ) from exc
+
+        insert_data = _response_data(insert_response)
+        if not insert_data:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to create folder path '{normalized}'",
+            )
+        current_id = insert_data[0]["id"]
+
+    if current_id is None:
+        raise HTTPException(
+            status_code=500, detail=f"Unable to determine folder id for '{normalized}'"
+        )
+
+    return current_id, normalized
+
+
+def _fetch_folder_info(
+    supabase: Any, folder_id: str, user_id: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
+    try:
+        query = supabase.table("folders").select("id, user_id, path, name").eq("id", folder_id)
+        if user_id:
+            query = query.eq("user_id", user_id)
+        response = query.limit(1).execute()
+    except Exception as exc:  # pragma: no cover
+        print(f"[folders] Unable to fetch folder info for id {folder_id}: {exc}")
+        return None
+    data = _response_data(response)
+    return data[0] if data else None
 
 
 def _resolve_folder_id(
@@ -105,19 +210,12 @@ def _resolve_folder_id(
 
     if folder_path:
         try:
-            response = (
-                supabase.table("folder_tree")
-                .select("id")
-                .eq("user_id", user_id)
-                .eq("full_path", folder_path)
-                .limit(1)
-                .execute()
-            )
-            data = _response_data(response)
-            if data:
-                return data[0]["id"]
+            ensured_id, _ = _ensure_folder_path(supabase, user_id, folder_path)
+            return ensured_id
+        except HTTPException:
+            raise
         except Exception as exc:  # pragma: no cover
-            print(f"[replicate] Unable to resolve folder_path '{folder_path}': {exc}")
+            print(f"[replicate] Unable to ensure folder_path '{folder_path}': {exc}")
             return None
 
     return None
@@ -164,9 +262,11 @@ def _build_asset_fileinfo(
         ext = ".png"
     filename = f"{prediction_id}_{index}{ext}"
 
-    segments = ["all", "replicate"]
+    segments: List[str] = ["all"]
     if folder_path:
         segments.extend(part for part in folder_path.split("/") if part)
+    else:
+        segments.append("replicate")
     segments.extend([prediction_id, filename])
     pseudo_path = "/".join(segments)
 
@@ -200,8 +300,14 @@ async def _store_assets_for_prediction(
     folder_path = metadata.get("folder_path")
     source_task_id = metadata.get("task_id") or job.get("task_id")
 
+    if folder_id and not folder_path:
+        folder_info = _fetch_folder_info(supabase, folder_id, user_id)
+        folder_path = _ltree_to_path(folder_info.get("path") if folder_info else None)  # type: ignore[union-attr]
+
     if not folder_id and folder_path:
-        folder_id = _resolve_folder_id(supabase, user_id, None, folder_path)
+        folder_id = _resolve_folder_id(
+            supabase, user_id, None, _normalize_folder_path(folder_path)
+        )
     if folder_id:
         folder_id = str(folder_id)
 
@@ -352,6 +458,7 @@ async def create_prediction(
         )
 
     supabase = get_supabase_client()
+    normalized_folder_path = _normalize_folder_path(payload.folder_path)
     try:
         prediction = replicate.predictions.create(
             model=MODEL_ID,
@@ -373,13 +480,19 @@ async def create_prediction(
     user_id = _extract_user_id(token_payload)
 
     resolved_folder_id: Optional[str] = None
+    resolved_folder_path: Optional[str] = normalized_folder_path
     if user_id:
         resolved_folder_id = _resolve_folder_id(
             supabase,
             user_id,
             payload.folder_id,
-            payload.folder_path,
+            normalized_folder_path,
         )
+        if resolved_folder_id and not resolved_folder_path:
+            folder_info = _fetch_folder_info(supabase, resolved_folder_id, user_id)
+            resolved_folder_path = _ltree_to_path(
+                folder_info.get("path") if folder_info else None  # type: ignore[union-attr]
+            )
 
     job_record: Dict[str, Any] = {
         "prediction_id": prediction.id,
@@ -388,6 +501,7 @@ async def create_prediction(
         "status": prediction.status,
         "metadata": {
             **payload.model_dump(exclude={"prompt"}, exclude_none=True),
+            "folder_path": resolved_folder_path,
             **({"resolved_folder_id": resolved_folder_id} if resolved_folder_id else {}),
         },
         "updated_at": _utc_now_iso(),
